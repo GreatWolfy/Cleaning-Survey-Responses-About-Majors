@@ -1,0 +1,137 @@
+---
+title: "Major_Recoding"
+author: "Jake Juliano"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# Standard Helper Libraries
+library(dplyr)
+library(tidyr)
+
+# Import
+library(readxl)
+
+# Web Scrape
+library(rvest)
+library(stringr)
+library(purrr)
+
+# Text Analysis
+library(tidytext)
+library(stringdist)
+library(cluster)
+library(dynamicTreeCut)
+```
+
+Load in data
+```{r}
+# Extract copied survey data
+responses_original = read_xlsx("C:/Users/Jake Juliano/OneDrive - University of North Carolina at Chapel Hill/Working_data_copy.xlsx")
+# Remove rows without real responses
+responses_editing = responses_original[!is.na(responses_original$Status),]
+responses_majors = responses_editing[,"Major"]
+  
+# Load in the course catalogue data
+html_course_catalogue = read_html("https://catalog.unc.edu/programs/")
+```
+
+Extract the names of the UNC-CH course catalogue
+```{r}
+# Extract the path to the subset of the HTML code containing the degree names
+isotopes <- html_course_catalogue |> html_elements(".isotope") |> html_elements(".item-container")
+# Create a table of the degrees and their associated keywords
+degrees_table <- isotopes |>
+  map_dfr(function(x) {
+    title = x |> html_element(".title") |> html_text2()
+    keywords = x |> html_elements(".keyword") |> html_text2()
+    tibble(
+      degree_uppercase = title,
+      keywords = list(keywords)
+    )
+  })
+head(degrees_table)
+```
+
+Restructure the two tables (responses and catalog) to make them more efficient to work with later on
+```{r}
+# Unify casing to be all lowercase
+degrees_table$degree_lowercase = tolower(degrees_table$degree_uppercase)
+responses_majors$Major_lowercase = tolower(responses_majors$Major)
+
+# Creating columns for major 1, major 2, minor 1, minor 2
+if (!any(sapply(c("major_1", "major_2", "minor_1", "minor_2", "is_graduate"), function(x) any(grepl(x, colnames(degrees_table)))))) {
+  degrees_table = cbind(degrees_table, major_1 = NA, 
+                                       major_2 = NA, 
+                                       minor_1 = NA, 
+                                       minor_2 = NA,
+                                       is_graduate = NA
+                      )
+}
+if (!any(sapply(c("major_1", "major_2", "minor_1", "minor_2", "is_graduate"), function(x) any(grepl(x, colnames(responses_majors)))))) {
+  responses_majors = cbind(responses_majors, major_1 = NA, 
+                                             major_2 = NA, 
+                                             minor_1 = NA, 
+                                             minor_2 = NA,
+                                             is_graduate = NA
+                      )
+}
+
+# Group the degrees in the catalog into degree categories
+offered_undergraduate_degrees = c("B.A.", "B.A.Ed.", "B.A.M.J.", "B.F.A.", "B.Mus.", "B.S.", "B.S.B.A.", "B.S.I.S.", "B.S.N.", "B.S.Ph.S.", "B.S.P.H.")
+offered_graduate_degrees = c("M.A.", "Ph.D.", "M.A.P.S.", "M.F.A.", "M.S.", "M.P.S. (Residential)", "M.P.S. (Online)", "M.S. (Management)", "D.C.R.P.", "M.A.D.S.", "Ed.D.", "M.A.T.", "M.Ed.", "M.S.E.E.", "M.P.H. (Concentration)", "M.P.S.", "M.H.A.", "M.S.P.H.", "M.S.I.S.", "M.S.L.S.", "J.D.", "D.N.P.", "M.S.N.", "M.P.H.", "M.H.S.", "Dr.P.H.", "M.S.C.R.", "M.S.D.M.", "M.P.P.", "M.S.W.", "M.C.R.P.", "(GRAD)", "M.P.A.", "M.C.", "DDS", "D.D.S.", "M.D.", "RD", "Pharm.D.", "Au.D.", "P.S.M.", "M.D./Ph.D.")
+
+degrees_table$degree_tier_uppercase <-
+  ifelse(endsWith(degrees_table$degree_uppercase, "Minor"), "Undergraduate Minor", 
+         ifelse(degrees_table$degree_uppercase %in% offered_undergraduate_degrees, "Undergraduate Major", "Masters Degree"))
+#based on academic similarity with Jaro-Winkler distance
+
+similarity_matrix_for_degrees = as.matrix(stringdistmatrix(degrees_table$degree_uppercase, method = "jw"))
+
+dist_matirx_for_degrees = as.dist(similarity_matrix_for_degrees)
+clustering_for_degrees = hclust(dist_matirx_for_degrees)
+dynamic_groups_for_degrees = cutreeDynamic(dendro = clustering_for_degrees, distM = similarity_matrix_for_degrees, deepSplit = 4) #machine assessment of correlation between degrees using dynamicTreeCut
+
+degrees_table = degrees_table %>%
+  mutate(cluster = dynamic_groups_for_degrees)
+degrees_table = degrees_table %>%
+  group_by(cluster) %>%
+  mutate(group_name = degree_uppercase[which.min(stringdist(degree_uppercase, unique(degree_uppercase)[1], method = "jw"))]) %>%
+  ungroup()
+degrees_table = degrees_table[, !names(degrees_table) %in% "cluster", drop=F]
+
+extract_basis_name <- function(degree) {
+  # Combine all suffixes into a single regex pattern
+  degree_suffix_pattern <- paste0("(", paste(c(offered_undergraduate_degrees, offered_graduate_degrees, "Minor"), collapse = "|"), ")(,|\\s)*")
+
+  # Remove any degree suffixes using the regex pattern
+  cleaned_degree <- gsub(degree_suffix_pattern, "", degree)
+
+  # Remove any trailing commas, spaces, or extra characters left after removing the suffixes
+  cleaned_degree <- trimws(gsub("\\s*,\\s*$", "", cleaned_degree))
+
+  return(cleaned_degree)
+}
+
+# Apply the function to get the basis name for each degree
+degrees_table <- degrees_table %>%
+  mutate(basis_name = sapply(degree_uppercase, extract_basis_name))
+```
+
+Re-code the survey response data
+```{r}
+# Inpute the graduate students
+responses_majors <- responses_majors %>%
+  mutate(
+    is_graduate = ifelse(is.na(Major_lowercase), "Yes", "No"),
+    major_1 = ifelse(is_graduate == "Yes", "Graduate", major_1),
+    major_2 = ifelse(is_graduate == "Yes", "Graduate", major_2),
+    minor_1 = ifelse(is_graduate == "Yes", "Graduate", minor_1),
+    minor_2 = ifelse(is_graduate == "Yes", "Graduate", minor_2)
+  )
+
+# Input the people with just one entry
+```
+
